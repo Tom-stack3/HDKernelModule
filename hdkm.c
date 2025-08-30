@@ -3,7 +3,6 @@
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/kprobes.h>
-#include <linux/stop_machine.h>
 #include <asm/cacheflush.h>
 
 MODULE_LICENSE("GPL");
@@ -66,20 +65,13 @@ static int try_register_blacklisted_kp(struct kprobe *kp_struct)
     return 0;
 }
 
-struct patch_args
-{
-    unsigned long addr;
-    int rc;
-};
-
-static int patch_within_kprobe_blacklist(void *args_struct)
+static int patch_within_kprobe_blacklist(unsigned long addr)
 {
     // Do as the following gdb commands:
     // x/1bx &addr+231+1  # Verify that there's 0x01 there
     // set {unsigned char}(&addr+231+1) = 0x00
 
-    struct patch_args *pa = args_struct;
-    unsigned char *p = (unsigned char *)(pa->addr + 231 + 1);
+    unsigned char *p = (unsigned char *)(addr + 231 + 1);
     unsigned char curr;
     void *(*text_poke)(void *addr, const void *opcode, size_t len);
     char op[1] = "\x00";
@@ -88,14 +80,14 @@ static int patch_within_kprobe_blacklist(void *args_struct)
     if (curr != 0x01)
     {
         pr_err("Unexpected value at %px: 0x%02x (expected 0x01)\n", p, (curr & 0xFF));
-        pa->rc = -EINVAL;
-        return 0;
+        return -EINVAL;
     }
 
     text_poke = (void *(*)(void *, const void *, size_t))my_lookup_address("text_poke");
 
     text_poke((void *)p, op, 1);
 
+    // Make sure to flash icache in case the I-Cache doesn't snoop from the D-Cache
     flush_icache_range((unsigned long)p, (unsigned long)p + 1);
     pr_info("flush_icache_range called on: %lx, %lx\n", (unsigned long)p, (unsigned long)p + 1);
 
@@ -103,12 +95,10 @@ static int patch_within_kprobe_blacklist(void *args_struct)
     if (curr != 0x00)
     {
         pr_err("Unexpected value at %px: 0x%02x (expected 0x01)\n", p, (curr & 0xFF));
-        pa->rc = -EINVAL;
-        return 0;
+        return -EINVAL;
     }
 
     pr_info("Patched %px: 0x01 -> 0x00\n", (void *)p);
-    pa->rc = 0;
     return 0;
 }
 
@@ -174,12 +164,12 @@ static int __init hdkm_init(void)
         return -1;
     }
     // Patch within_kprobe_blacklist to return always return true
-    // Run on one CPU and stop others
-    struct patch_args pa = {
-        .addr = my_lookup_address("within_kprobe_blacklist"),
-        .rc = 0,
-    };
-    stop_machine(patch_within_kprobe_blacklist, &pa, NULL);
+    // flush_icache_range is called from within
+    if (patch_within_kprobe_blacklist(my_lookup_address("within_kprobe_blacklist")) != 0)
+    {
+        pr_err("hdkm: Failed patching within_kprobe_blacklist");
+        return -1;
+    }
 
     // This time should succeeded
     if (try_register_blacklisted_kp(&second_try_forbidden_kp) != 0)
